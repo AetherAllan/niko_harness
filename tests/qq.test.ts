@@ -14,6 +14,7 @@ const incoming = (overrides: Record<string, unknown> = {}) => ({
   message: [{ type: 'text', data: { text: '你觉得呢？' } }, { type: 'at', data: { qq: self } }, { type: 'reply', data: { id: '800' } }], ...overrides,
 });
 const providers: Providers = {
+  window: async messages => ({ messages, tokens: 0, budget: 1760, exact: true }),
   exaConfigured: () => false,
   modelStatus: async () => ({ available: true, loraVerified: true, contextSize: 4096, model: 'test', adapter: 'test', detail: '' }),
   judge: async () => ({ probabilities: { should_reply: 1, needs_web: 0, needs_memory: 0 }, raw: {} }),

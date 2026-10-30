@@ -59,8 +59,9 @@ const broadcast = () => {
 };
 const persist = (room: Room) => {
   const target = roomHarness(room);
-  const serialized = JSON.stringify(target.state);
   writeQueue = writeQueue.then(async () => {
+    await target.compactContext();
+    const serialized = JSON.stringify(target.savedState());
     const path = stateFile(room);
     await writeFile(path + '.tmp', serialized, { mode: 0o600 });
     await rename(path + '.tmp', path);
@@ -72,6 +73,7 @@ const persist = (room: Room) => {
 const harness = new Harness(state, createProviders(ROOT), () => persist('lab'));
 const qqHarness = new Harness(qqState, createProviders(ROOT), () => persist('qq'), (message, run, signal) => qqBridge.deliver(message, run, signal));
 const qqBridge = new QQBridge(message => { qqHarness.receiveMessage(message); }, broadcast);
+await Promise.all([harness.compactContext(), qqHarness.compactContext()]);
 const server = createServer();
 const dev = process.argv.includes('--dev');
 const vite = dev ? await (await import('vite')).createServer({
@@ -134,7 +136,10 @@ server.on('request', async (request, response) => {
       const input = await body(request);
       if (url.pathname === '/api/messages') {
         if (room === 'qq') throw new Error('QQ 会话只接收真实群消息；请在手机 QQ 的限定群内发言');
-        return json(response, harness.addMessage(input), 201);
+        const message = harness.addMessage(input);
+        await harness.compactContext();
+        if (!harness.state.messages.some(m => m.id === message.id)) throw new Error('这条消息超过 2048 的可用窗口，原文未保留，请缩短后再发');
+        return json(response, message, 201);
       }
       if (url.pathname === '/api/settings') { harness.settings(input); return json(response, { ok: true }); }
       if (url.pathname === '/api/pause') {
@@ -170,7 +175,7 @@ server.on('request', async (request, response) => {
         await reloadEnv(); roomHarness('lab').providers = createProviders(ROOT); qqHarness.providers = createProviders(ROOT); qqBridge.start(); broadcast(); return json(response, { ok: true });
       }
       if (url.pathname === '/api/model/start') {
-        if (harness.busy) throw new Error('请等待本轮结束');
+        if (roomHarness('lab').busy || qqHarness.busy) throw new Error('请等待所有会话的本轮结束');
         const { stdout } = await promisify(execFile)('python3', [resolve(ROOT, 'scripts/model.py'), 'start'], { cwd: ROOT, timeout: 250_000, maxBuffer: 30_000 });
         harness.model = await harness.providers.modelStatus(); broadcast(); return json(response, { ok: true, detail: stdout });
       }

@@ -110,16 +110,17 @@ export class QQBridge {
     const info = await this.call('get_login_info', {});
     const selfId = numericId(info?.user_id);
     if (!selfId) throw new Error('无法确认机器人 QQ 登录身份');
-    const [group, member] = await Promise.all([
+    const [group, member, members] = await Promise.all([
       this.call('get_group_info', { group_id: Number(QQ_GROUP_ID), no_cache: true }),
       this.call('get_group_member_info', { group_id: Number(QQ_GROUP_ID), user_id: Number(selfId), no_cache: true }),
+      this.call('get_group_member_list', { group_id: Number(QQ_GROUP_ID) }),
     ]);
     if (String(group?.group_id) !== QQ_GROUP_ID || String(member?.user_id) !== selfId || socket !== this.socket) throw new Error('机器人不在允许测试的群 1104887928');
-    this.status = { ...this.status, connected: true, ready: true, selfId, groupName: String(group.group_name || QQ_GROUP_ID).slice(0, 80), detail: '已连接；仅接收和发送群 1104887928 的消息' };
+    this.status = { ...this.status, connected: true, ready: true, selfId, groupName: String(group.group_name || QQ_GROUP_ID).slice(0, 80), members: Array.isArray(members) ? members.filter(m => String(m.user_id) !== selfId).map(m => ({ id: String(m.user_id), name: String(m.card || m.nickname || m.user_id).slice(0, 40) })) : [], detail: '已连接；仅接收和发送群 1104887928 的消息' };
     this.changed();
   }
 
-  private call(action: 'get_login_info' | 'get_group_info' | 'get_group_member_info' | 'send_group_msg', params: unknown): Promise<any> {
+  private call(action: 'get_login_info' | 'get_group_info' | 'get_group_member_info' | 'get_group_member_list' | 'send_group_msg', params: unknown): Promise<any> {
     if (this.socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('NapCat 尚未连接'));
     const echo = randomUUID();
     return new Promise((resolve, reject) => {

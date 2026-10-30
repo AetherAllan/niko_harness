@@ -72,3 +72,32 @@ test('Jev and Exa adapters use documented request contracts and compact the resp
   assert.equal(calls[1].body.numResults, 3);
   assert.equal(results[0].snippet.length, 420);
 });
+
+test('hot sampling reaches llama.cpp and output reservation changes the cached rolling budget', async t => {
+  const temp = await mkdtemp(join(tmpdir(), 'niko-sampling-'));
+  const root = join(temp, 'harness'); await mkdir(root);
+  await writeFile(join(temp, 'system-prompt.txt'), '喵酱人设'); await writeFile(join(temp, 'ui-config.json'), '{}');
+  t.after(() => rm(temp, { recursive: true }));
+  const completions: any[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string, options?: RequestInit) => {
+    const path = new URL(url).pathname;
+    if (path === '/health') return Response.json({ status: 'ok' });
+    if (path === '/props') return Response.json({ model_path: join(temp, 'models/Qwen3-8B-Q8_0.gguf'), default_generation_settings: { n_ctx: 2048 } });
+    if (path === '/lora-adapters') return Response.json([{ path: join(temp, 'models/source31-lora-f16.gguf'), scale: 1 }]);
+    if (path === '/apply-template') return Response.json({ prompt: 'native template' });
+    if (path === '/tokenize') return Response.json({ tokens: [1, 2, 3] });
+    completions.push(JSON.parse(options!.body as string));
+    return Response.json({ choices: [{ message: { content: '新回复' } }], usage: { prompt_tokens: 3, completion_tokens: 3 } });
+  });
+  const h = new Harness(initialState(), {} as Providers, () => {}); h.addMessage({ speakerId: 'aqing', text: '新话题' });
+  const p = createProviders(root), snapshot = takeSnapshot(h.state)!, signal = new AbortController().signal;
+  const first = await p.window(snapshot.messages, signal, DEFAULT_SETTINGS);
+  const changed = { ...DEFAULT_SETTINGS, sampling: { ...DEFAULT_SETTINGS.sampling, max_tokens: 512, temperature: 0.9, repeat_penalty: 1.15 } };
+  const next = await p.window(snapshot.messages, signal, changed);
+  assert.equal(first.budget, 1760); assert.equal(next.budget, 1440);
+  await p.generate(snapshot, DEFAULT_SETTINGS, '', [], signal, () => {});
+  await p.generate(snapshot, changed, '', [], signal, () => {});
+  assert.equal(completions[0].temperature, 0.8); assert.equal(completions[1].temperature, 0.9);
+  assert.equal(completions[1].max_tokens, 512); assert.equal(completions[1].repeat_penalty, 1.15);
+  assert.equal(completions[0].presence_penalty, 0.8); assert.deepEqual(completions[0].tools, []);
+});

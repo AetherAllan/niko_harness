@@ -2,6 +2,8 @@
 
 本机群聊原型：随机心跳 → Jev 的三个独立 Noul 判断 → 必要时 Exa 查询 → 原版 source31 自主生成。支持本地模拟，以及唯一允许的 QQ 测试群 **1104887928**。没有独立 planner、训练或向量数据库。
 
+日常操作请看 [使用与启动说明](使用与启动.md)，包含 Mock / 真实 QQ 的启动步骤、自动接话开关、热加载调参、关闭和常见问题。
+
 ## 启动
 
 双击本目录的 `start.command`，打开 **http://127.0.0.1:4317**。它启动页面并复用现有模型文件；父目录的配置和启动脚本保持原样。若 8080 已有正确的 source31 服务，会直接复用，页面显示它的实际上下文。
@@ -47,7 +49,7 @@ Jev 会接收本轮群聊片段和人设；Exa 只接收本地模型提取并经
 
 `NAPCAT_WS_URL` 和 `NAPCAT_TOKEN` 已在本机 `.env` 配对配置，连接地址只允许回环地址。WebUI 与 OneBot 端口只映射到 `127.0.0.1:6099` / `127.0.0.1:3001`。登录态失效时需手机扫码；登录页面为 `http://127.0.0.1:6099/webui`，WebUI 登录凭据在 `data/napcat/config/webui.json`，它与 OneBot Token 不同。不要在聊天中粘贴该文件。
 
-QQ 独立记录在 `data/qq-1104887928.json`，模拟消息仍在 `data/state.json`。不拉取历史群消息；只处理连接后收到的新事件。重复消息 ID 不重复入队，最近 100 轮轨迹和 1000 条消息保存在本地，已处理旧消息会在接收新消息时滚动淘汰。网页可导出 QQ 记录，但不提供清空按钮。
+QQ 独立记录在 `data/qq-1104887928.json`，模拟消息仍在 `data/state.json`。不拉取 QQ 历史；只处理连接后收到的新事件。消息按原生 tokenizer 的 2048 总窗口滚动保留，超出后移除最旧完整消息；单条消息过大无法容纳时也会移出。最多保留 100 轮运行统计，但过期快照、模型输入、Jev 原文及旧输出会一并清掉，不能重试已过期快照。网页可导出当前窗口，但不提供 QQ 清空按钮。这个限制针对 Harness 工作记录；不删除 QQ 客户端的聊天记录。
 
 发送前先落盘意图，再等待 NapCat 的消息 ID 回执。连接中断、超时或进程重启造成的发送不确定性会显示为错误，**不会自动重发，也禁止手动重试该轮**；先到 QQ 核对。生成之前的错误仍可以手动重试。
 
@@ -60,30 +62,40 @@ docker compose -f napcat.compose.yml stop
 
 ## 使用
 
-- 切换阿青、小白、柚子发言；点击「@喵酱」或消息旁的回复按钮建立明确关系。处理期间仍可继续发送消息。
+- 在 Mock 模式切换已保存的群友身份发言（名字可在设置中修改）；点击「@喵酱」或消息旁的回复按钮建立明确关系。处理期间仍可继续发送消息。
 - 「单步心跳」处理当前未处理消息；「开始观察」启用随机循环。默认先暂停，避免启动就产生 API 请求。
 - 随机间隔默认 5–12 秒，定义为**上一轮结束后**到下一轮开始的等待。它不是经过校准的最佳间隔。暂停心跳会让当前快照处理完毕，停止安排后续轮次。
 - 每轮优先选择最新的明确 @喵酱消息作为焦点，其次是最新的回复喵酱消息，否则取最新消息。三个 Noul 围绕同一焦点判断，其他消息作为背景。
-- 明确 @喵酱时，程序的接话决策固定为 100%，与 Jev 返回的 `should_reply` 分开保存。Jev 仍判断联网和记忆需求；其他人的 @ 和仅在正文写出名字不触发这个规则。未被 @ 的消息使用会话中设置的接话阈值（当前 QQ 测试群为 60%）。
+- 明确 @喵酱时，程序的接话决策固定为 100%，与 Jev 返回的 `should_reply` 分开保存。支持 QQ 的真实 @ 标记，也支持正文中的 `@喵酱`（后接空白或标点）。Jev 仍判断联网和记忆需求；@ 其他人和普通提到名字不强制接话。未被 @ 的消息使用会话中设置的接话阈值（当前 QQ 测试群为 60%）。
 - 一次成功判断（包括沉默）就消费这份快照。新到消息留给下一次；喵酱自己的发言不触发下一轮。
 - Jev 失败至多自动重试一次；最终失败会记录并消费快照，避免无限重复计费。可手动重试。生成失败后的重试复用成功的 Jev 判断和已取得的搜索结果；成功重试后不能再次重复回复。
 - `[[NO_REPLY]]` 仅在完整输出等于该标记时被吞掉，不发送到聊天里。
 
-右侧可查看概率、阈值、焦点、各阶段耗时、搜索词、引用网页、实际 token 预算和原始请求。历史页保存最近 100 轮轨迹。所有聊天与轨迹原子写入 `data/state.json`，最多 1000 条消息；新建实验前可导出记录。
+右侧可查看概率、阈值、焦点、各阶段耗时、搜索词、引用网页、实际 token 预算和原始请求。历史页保存最近 100 轮运行统计，过期原文不会保留在消息、Jev 原始响应、模型输入或运行快照里。当前窗口原子写入 `data/state.json`（QQ 为独立文件）；新建 Mock 实验前可导出当前窗口。
 
 「演示回放」使用固定夹具与预录台词，醒目标注，不调用任何模型或外部 API。它用于观察界面和分支，不代表 Jev 或 source31 的质量。演示会追加到当前会话并暂停自动心跳；想进行干净的质量对照，请先导出再新建实验。
+
+## Mock 试聊与热加载参数
+
+页面顶部「Mock 试聊」进入独立本地会话，消息不会发送到 QQ。到「连接与参数 → Mock 群友」点击「载入测试群的其他成员」，可复制除机器人以外的群友名字，也可以直接改模拟名字。保存后回到聊天，切换发言人连续发消息；支持 @喵酱、引用、随机心跳和单步判断。
+
+「连接与参数」可以热加载温度、top-p、top-k、min-p、重复惩罚、惩罚窗口、presence/frequency penalty、最大输出长度，以及心跳、三个判断阈值和搜索预算。每个会话独立保存，处理中的快照冻结参数，下一轮使用新值。2048 是实际模型服务的固定窗口，不作为网页中的可热改参数。
+
+模型未就绪时，用 UTF-8 字节数保守限制记录长度，页面明确显示非精确估算；恢复后重新用原生 tokenizer 计数。窗口外的内容不会送入下一轮，也不会保留在运行轨迹原文中。用户自行下载的导出文件不参与自动滚动。
 
 ## 模型与上下文
 
 复用父目录的 `system-prompt.txt`、`ui-config.json` 和已验证的 GGUF 文件。角色名字统一为「喵酱」，猫娘是角色设定；原始身份配置备份在 `data/backups/`，采样设置保留。每次真实生成前检查 `/props` 与 `/lora-adapters`：必须是指定 Q8_0 底模、指定 source31 LoRA 且强度为 1.0，否则阻止生成。
 
-新启动入口默认 4096 上下文、单请求、Metal 全层、Flash Attention、128/64 batch、Q8_0 K/V 缓存；关闭额外主机提示缓存。保留 0.7 / 0.8 / 20 / 0 采样、192 输出 token 与 non-thinking 模式。KV 缓存精度变化仍可能影响数值结果，不声称与 F16 KV 逐字等价。
+新启动入口默认 **2048 上下文**、单请求、Metal 全层、Flash Attention、128/64 batch、Q8_0 K/V 缓存；关闭额外主机提示缓存。当前回复默认温度 0.8 / top-p 0.8 / top-k 20 / min-p 0，重复惩罚 1.12、窗口 512、presence 0.8、frequency 0，最大输出 192，non-thinking。参数来自少量真实失败片段的回放，只是可调起点；仍需多轮试聊。
 
-生成前用同一服务的 `/apply-template` + `/tokenize` 对完整输入计数。输入预算为 `min(实际上下文,4096) - 192 - 96`；优先裁旧消息、保留焦点和其引用。焦点与人设本身过长时明确报错，不静默截断。固定系统前缀与前置历史有利于单 slot 的 prompt cache；不会为了缓存额外常驻 8 GiB 主机内存。
+生成前用同一服务的 `/apply-template` + `/tokenize` 对完整输入计数。输入预算为 `min(实际上下文,2048) - 当前最大输出 token - 96`。窗口包含所有群友的发言和喵酱自己的回复，不按“是否和她有关”筛选，也不再按最近 14 条截断。按时间移出最旧完整消息，不从窗口外重新拉回引用原文。喵酱的旧回复使用真正的 `assistant` 轮次，群友发言使用带发言人标记的 `user` 轮次。固定系统前缀与前置历史有利于单 slot 的 prompt cache；不会为了缓存额外常驻 8 GiB 主机内存。
 
-Exa 默认最多 3 条结果，只请求 `contents.highlights.maxCharacters=420`，不请求全文或额外摘要。每条再作本地长度限制，网页资料总预算默认 600 token，超出后继续裁剪。网页文字作为资料传入，不能覆盖系统规则。未配置、搜索失败、零结果分别明确记录。
+Exa 默认最多 3 条结果，只请求 `contents.highlights.maxCharacters=420`，不请求全文或额外摘要。每条再作本地长度限制，网页资料总预算默认 300 token，先将搜索摘要限制在其预算内；总窗口仍超出时再移出较旧群聊，保留焦点和必要资料。网页文字作为资料传入，不能覆盖系统规则。未配置、搜索失败、零结果分别明确记录。
 
 搜索词提取使用同一个 source31，通过约束为 `{"query":"..."}` 的 JSON 输出减少聊天语气污染；这不是工具调用，也不是回复规划。程序验证和清理搜索词后自行调用 Exa。普通闲聊只有一次本地回复生成；需要搜索时会多一次本地查询提取。
+
+完全相同或大段复用最近四条自己长回复的输出会被拦截、选择沉默，不自动重试。
 
 记忆接口在 `server/providers.ts:retrieveMemory`，第一版始终返回未启用。`needs_memory` 通过后也不会伪装成成功检索到历史。
 
@@ -98,7 +110,7 @@ node scripts/smoke-local.ts
 `smoke-local.ts` 使用真实本地 source31 和 tokenizer，配合合成聊天与固定参考资料测试搜索词提取、长上下文裁剪和实际生成，不调用 Jev / Exa。
 
 - `reports/inference-benchmark.json`：三组 4096 启动设置、冷 / 热前缀、真实回复和系统压力。
-- `reports/local-smoke.json`：真实查询提取与接近 4K 的裁剪测试；资料为夹具，来源明确。
+- `reports/local-smoke.json`：真实查询提取与 2048 总窗口的裁剪测试；资料为夹具，来源明确。
 - `reports/live-search-run.json`：配置密钥后的真实 Jev → Exa → source31 联调（若已运行）。
 - `reports/http-checks.json`：本地来源限制和导出接口检查。
 - [推理研究与限制](reports/INFERENCE.md)。
@@ -107,8 +119,10 @@ node scripts/smoke-local.ts
 
 ## 代码范围
 
-`server/core.ts` 管时序和快照；`server/providers.ts` 管 Jev、Exa、本地模型和预算；`server/qq.ts` 管限定群的 OneBot 正向 WebSocket 收发；`server/index.ts` 提供本地 HTTP / SSE 和原子持久化。前端是 React + TypeScript + Vite，使用 Cult UI 的 TextureCard；来源和 MIT 许可见 `THIRD_PARTY_NOTICES.md`。
+`server/context.ts` 管原生对话拼接、窗口裁剪、原文过期与复读拦截；`server/core.ts` 管时序和快照；`server/providers.ts` 管 Jev、Exa、本地模型和预算；`server/qq.ts` 管限定群的 OneBot 正向 WebSocket 收发；`server/index.ts` 提供本地 HTTP / SSE 和原子持久化。前端是 React + TypeScript + Vite，使用 Cult UI 的 TextureCard；来源和 MIT 许可见 `THIRD_PARTY_NOTICES.md`。
 
 官方接口依据：[TypeSafe System One](https://docs.typesafe.ai/api/system-one)、[Noul](https://docs.typesafe.ai/primitives/noul)、[Exa Search](https://exa.ai/docs/reference/search)、[Exa highlights 预算](https://github.com/exa-labs/agent-skills/blob/main/skills/build-with-exa/references/search.md)。
 
 QQ 依据：[NapCat Docker 官方说明](https://github.com/NapNeko/NapCat-Docker)、[NapCat 网络配置](https://doc.napneko.icu/config/basic)、[OneBot 11 群消息接口](https://github.com/botuniverse/onebot-11/blob/master/api/public.md)。
+
+采样参考：[Qwen3 官方建议](https://huggingface.co/Qwen/Qwen3-8B#best-practices)、[llama.cpp 采样字段](https://github.com/ggml-org/llama.cpp/blob/e0f142d5ddc1461ce721644d92af33db23545105/tools/server/README.md)。旧 4096 测速是历史记录，不代表当前设置。

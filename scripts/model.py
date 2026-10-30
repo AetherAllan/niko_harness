@@ -56,13 +56,18 @@ def stop():
     raise RuntimeError('Model did not stop; inspect logs/model.log.')
 
 
-def start(ctx=4096, batch=128, ubatch=64, kv='q8_0', spec='none'):
+def start(ctx=2048, batch=128, ubatch=64, kv='q8_0', spec='none'):
     try:
         health = api('/health')
     except OSError:
         health = None
     if health and health.get('status') == 'ok':
         props = api('/props')
+        if props['default_generation_settings']['n_ctx'] != ctx:
+            if owned_pid() is None:
+                raise RuntimeError(f'Existing model context differs from requested {ctx}; external service was left untouched.')
+            stop()
+            return start(ctx, batch, ubatch, kv, spec)
         adapters = api('/lora-adapters')
         expected = str(MODEL_ROOT / 'models/source31-lora-f16.gguf')
         if not any(a.get('path') == expected and a.get('scale') == 1 for a in adapters):
@@ -121,7 +126,7 @@ def start(ctx=4096, batch=128, ubatch=64, kv='q8_0', spec='none'):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['start', 'stop'])
-    parser.add_argument('--ctx', type=int, choices=[2048, 4096], default=4096)
+    parser.add_argument('--ctx', type=int, choices=[2048, 4096], default=2048)
     parser.add_argument('--batch', type=int, default=128)
     parser.add_argument('--ubatch', type=int, default=64)
     parser.add_argument('--kv', choices=['f16', 'q8_0'], default='q8_0')

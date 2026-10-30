@@ -3,6 +3,7 @@ import { BOT_ID, BOT_NAME, DEFAULT_SETTINGS, EMPTY_MODEL, NO_REPLY, SPEAKERS } f
 import type { Message, ModelStatus, PublicState, Run, Settings, Snapshot, State, Step } from '../shared.ts';
 import type { Providers } from './providers.ts';
 import { retrieveMemory } from './providers.ts';
+import { expireRuns, repeatsReply } from './context.ts';
 
 export function initialState(): State {
   return { messages: [], runs: [], cursor: 0, nextSeq: 1, paused: true, settings: structuredClone(DEFAULT_SETTINGS) };
@@ -18,6 +19,9 @@ export function validateSettings(input: unknown): Settings {
   const heartbeatMin = number(s.heartbeatMin, 1, 120, '心跳下限');
   const heartbeatMax = number(s.heartbeatMax, 1, 120, '心跳上限');
   if (heartbeatMax < heartbeatMin) throw new Error('心跳上限不能小于下限');
+  const sampling = { ...DEFAULT_SETTINGS.sampling, ...s.sampling };
+  const mockSpeakers = s.mockSpeakers || DEFAULT_SETTINGS.mockSpeakers;
+  if (!Array.isArray(mockSpeakers) || !mockSpeakers.length || mockSpeakers.length > 10 || new Set(mockSpeakers.map(s => s?.id)).size !== mockSpeakers.length || mockSpeakers.some(s => !s || typeof s.id !== 'string' || s.id === BOT_ID || !/^[\w-]{1,64}$/.test(s.id) || typeof s.name !== 'string' || !s.name.trim() || s.name.length > 40)) throw new Error('Mock 群友需为 1–10 位，名字不超过 40 字，身份不能重复或冒充喵酱');
   return {
     heartbeatMin, heartbeatMax,
     thresholds: {
@@ -25,25 +29,32 @@ export function validateSettings(input: unknown): Settings {
       needs_web: number(s.thresholds?.needs_web, 0, 1, '搜索阈值'),
       needs_memory: number(s.thresholds?.needs_memory, 0, 1, '记忆阈值'),
     },
-    historyCount: number(s.historyCount, 2, 30, '历史条数', true),
     searchResults: number(s.searchResults, 1, 5, '搜索条数', true),
     searchSnippetChars: number(s.searchSnippetChars, 400, 1000, '每条摘要长度', true),
     searchTokenBudget: number(s.searchTokenBudget, 150, 1000, '搜索 token 预算', true),
     jevModel: typeof s.jevModel === 'string' && /^[\w./-]{1,100}$/.test(s.jevModel) ? s.jevModel : 'jev-latest',
+    sampling: {
+      temperature: number(sampling.temperature, 0.1, 1.5, '温度'), top_p: number(sampling.top_p, 0.05, 1, 'Top P'),
+      top_k: number(sampling.top_k, 0, 200, 'Top K', true), min_p: number(sampling.min_p, 0, 1, 'Min P'),
+      repeat_penalty: number(sampling.repeat_penalty, 1, 1.5, '重复惩罚'), repeat_last_n: number(sampling.repeat_last_n, 0, 2048, '惩罚窗口', true),
+      presence_penalty: number(sampling.presence_penalty, 0, 2, 'Presence penalty'), frequency_penalty: number(sampling.frequency_penalty, 0, 2, 'Frequency penalty'),
+      max_tokens: number(sampling.max_tokens, 16, 512, '最大输出 token', true),
+    },
+    mockSpeakers: mockSpeakers.map(s => ({ id: s.id, name: s.name.trim() })),
   };
+}
+
+function mentionsBot(message: Message): boolean {
+  return message.mentions.includes(BOT_ID) || /(?:^|\s)@喵酱(?=$|[\s，。！？、,:：.!?])/u.test(message.text);
 }
 
 export function takeSnapshot(state: State): Snapshot | null {
   const newMessages = state.messages.filter(m => m.seq > state.cursor && m.speakerId !== BOT_ID);
   if (!newMessages.length) return null;
-  const focus = newMessages.findLast(m => m.mentions.includes(BOT_ID))
+  const focus = newMessages.findLast(mentionsBot)
     || newMessages.findLast(m => state.messages.find(r => r.id === m.replyTo)?.speakerId === BOT_ID)
     || newMessages[newMessages.length - 1];
-  const messages = state.messages.slice(-state.settings.historyCount);
-  for (const required of [focus, state.messages.find(m => m.id === focus.replyTo)]) {
-    if (required && !messages.some(m => m.id === required.id)) messages.push(required);
-  }
-  messages.sort((a, b) => a.seq - b.seq);
+  const messages = state.messages;
   return structuredClone({ messages, newMessages, focus, through: newMessages[newMessages.length - 1].seq });
 }
 
@@ -52,6 +63,7 @@ export function isNoReply(text: string): boolean { return !text.trim() || text.t
 export function retryableRun(state: State, id: string): Run {
   const run = state.runs.find(r => r.id === id);
   if (!run || run.status !== 'error' || run.mode !== 'live') throw new Error('只能手动重试失败的真实运行');
+  if (run.expired) throw new Error('这份快照的原文已移出 2048 滚动窗口，不能重试');
   if (run.delivery) throw new Error('已尝试向 QQ 发出消息，请先在群里核对；为避免重复发送，不能重试这轮');
   const root = run.retriedFrom || run.id;
   if (state.runs.some(r => (r.id === root || r.retriedFrom === root) && ['replied', 'silent'].includes(r.status))) throw new Error('这份快照已经完成，不能重复回复');
@@ -69,6 +81,7 @@ export class Harness {
   private timer?: ReturnType<typeof setTimeout>;
   private controller?: AbortController;
   private epoch = 0;
+  private compactQueue = Promise.resolve();
   private deliver?: (message: Message, run: Run, signal: AbortSignal) => Promise<void>;
 
   constructor(state: State, providers: Providers, onChange: () => void | Promise<void>, deliver?: (message: Message, run: Run, signal: AbortSignal) => Promise<void>) {
@@ -92,18 +105,46 @@ export class Harness {
 
   view(): PublicState {
     return {
-      ...this.state, busy: this.busy, nextHeartbeatAt: this.nextHeartbeatAt,
+      ...this.savedState(), busy: this.busy, nextHeartbeatAt: this.nextHeartbeatAt,
       services: { jevConfigured: Boolean(process.env.TYPESAFE_API_KEY), exaConfigured: this.providers.exaConfigured(), model: this.model },
       storageError: this.storageError,
     };
   }
 
+  savedState(): State {
+    const state = structuredClone(this.state);
+    expireRuns(state, true);
+    return state;
+  }
+
+  compactContext(): Promise<void> {
+    const task = this.compactQueue.then(async () => {
+      const state = this.state;
+      let version: number, settings: Settings, result;
+      do {
+        version = state.nextSeq;
+        settings = state.settings;
+        result = await this.providers.window([...state.messages], AbortSignal.timeout(15_000), settings);
+        if (state !== this.state) return;
+      } while (version !== state.nextSeq || settings !== state.settings);
+      const ids = new Set(result.messages.map(m => m.id));
+      const removed = state.messages.filter(m => !ids.has(m.id));
+      state.messages = result.messages;
+      const expiredPrefix = removed.filter(m => m.seq < (result.messages[0]?.seq ?? Infinity));
+      if (expiredPrefix.length) state.cursor = Math.max(state.cursor, ...expiredPrefix.map(m => m.seq));
+      state.context = { tokens: result.tokens, budget: result.budget, exact: result.exact, discarded: (state.context?.discarded || 0) + removed.length };
+      expireRuns(state);
+    });
+    this.compactQueue = task.catch(() => {});
+    return task;
+  }
+
   addMessage(input: { speakerId: string; text: string; replyTo?: string; mentions?: string[]; sample?: boolean }): Message {
-    const speaker = SPEAKERS.find(s => s.id === input.speakerId);
+    const speaker = this.state.settings.mockSpeakers.find(s => s.id === input.speakerId);
     if (!speaker) throw new Error('请选择一个模拟群友');
     if (typeof input.text !== 'string' || !input.text.trim() || input.text.length > 2000) throw new Error('消息需为 1–2000 个字符');
     if (input.replyTo && !this.state.messages.some(m => m.id === input.replyTo)) throw new Error('回复对象已不存在');
-    if (input.mentions && (!Array.isArray(input.mentions) || input.mentions.some(id => ![BOT_ID, ...SPEAKERS.map(s => s.id)].includes(id)))) throw new Error('@ 对象不正确');
+    if (input.mentions && (!Array.isArray(input.mentions) || input.mentions.some(id => ![BOT_ID, ...this.state.settings.mockSpeakers.map(s => s.id)].includes(id)))) throw new Error('@ 对象不正确');
     if (this.state.messages.length >= 1000) throw new Error('实验室已达到 1000 条消息，请先导出并新建实验');
     const seq = this.state.nextSeq++;
     const message: Message = { id: `m_${seq}`, seq, speakerId: speaker.id, speakerName: speaker.name, text: input.text.trim(), at: new Date().toISOString(), mentions: input.mentions || [], replyTo: input.replyTo || undefined, sample: input.sample === true };
@@ -159,11 +200,21 @@ export class Harness {
 
   async tick(trigger: Run['trigger'] = 'manual', options: { replay?: Providers; retry?: string } = {}): Promise<Run | null> {
     if (this.busy) throw new Error('当前心跳仍在处理，消息会留给下一轮');
-    const previous = options.retry ? retryableRun(this.state, options.retry) : undefined;
-    const snapshot = previous ? structuredClone(previous.snapshot) : takeSnapshot(this.state);
+    const captured = takeSnapshot(this.state);
+    const capturedSettings = structuredClone(this.state.settings);
+    this.busy = true;
+    let previous: Run | undefined, snapshot: Snapshot | null;
+    try {
+      await this.compactContext();
+      previous = options.retry ? retryableRun(this.state, options.retry) : undefined;
+      const retained = new Set(this.state.messages.map(m => m.id));
+      snapshot = previous ? structuredClone(previous.snapshot) : captured && takeSnapshot({ ...this.state, messages: captured.messages.filter(m => retained.has(m.id)) });
+    } catch (error) {
+      this.busy = false; this.storageError = `上下文准备失败：${(error as Error).message}`; this.schedule(); this.onChange(); throw error;
+    }
     if (this.timer) clearTimeout(this.timer);
     this.nextHeartbeatAt = null;
-    if (!snapshot) { this.schedule(); this.onChange(); return null; }
+    if (!snapshot) { this.busy = false; this.schedule(); this.onChange(); return null; }
     const epoch = this.epoch;
     const controller = new AbortController();
     this.controller = controller;
@@ -171,7 +222,7 @@ export class Harness {
     const run: Run = {
       id: randomUUID(), mode: options.replay ? 'replay' : 'live', status: 'running', phase: '准备消息快照',
       startedAt: new Date().toISOString(), trigger, snapshot,
-      settings: structuredClone(previous?.settings || this.state.settings), steps: [], retriedFrom: previous ? previous.retriedFrom || previous.id : undefined,
+      settings: structuredClone(previous?.settings || capturedSettings), steps: [], retriedFrom: previous ? previous.retriedFrom || previous.id : undefined,
     };
     this.state.runs.push(run);
     this.state.runs = this.state.runs.slice(-100);
@@ -201,7 +252,7 @@ export class Harness {
         run.probabilities = judgment.probabilities;
         run.jevRaw = judgment.raw;
       }
-      run.replyDecision = snapshot.focus.mentions.includes(BOT_ID)
+      run.replyDecision = mentionsBot(snapshot.focus)
         ? { probability: 1, source: 'mention' }
         : { probability: run.probabilities.should_reply, source: 'jev' };
       if (run.replyDecision.probability < run.settings.thresholds.should_reply) {
@@ -226,13 +277,26 @@ export class Harness {
         } else { run.searchStatus = '本轮不需要搜索'; skip('Exa 搜索', run.searchStatus); }
         run.memoryStatus = run.probabilities.needs_memory >= run.settings.thresholds.needs_memory ? retrieveMemory().status : '本轮不需要检索历史记忆';
         skip('历史记忆', run.memoryStatus);
-        const completion = await step('本地喵酱生成', () => providers.generate(snapshot, run.settings, `${run.searchStatus}。${run.memoryStatus}。`, run.search || [], controller.signal, prompt => { current(); run.prompt = prompt; publish(); }), run.mode === 'replay' ? '演示回放：展示预录回复，不调用本地模型' : '校验 source31 LoRA → 原生模板计数 → 裁剪预算 → 普通文本生成');
+        const completion = await step('本地喵酱生成', () => providers.generate(snapshot, run.settings, `${run.searchStatus}。${run.memoryStatus}。`, run.search || [], controller.signal, prompt => {
+          current(); run.prompt = prompt;
+          if (prompt.messageIds) {
+            const captured = new Set(snapshot.messages.map(m => m.id)), kept = new Set(prompt.messageIds);
+            const before = this.state.messages.length;
+            this.state.messages = this.state.messages.filter(m => !captured.has(m.id) || kept.has(m.id));
+            if (this.state.context) this.state.context.discarded += before - this.state.messages.length;
+          }
+          publish();
+        }), run.mode === 'replay' ? '演示回放：展示预录回复，不调用本地模型' : '校验 source31 LoRA → 原生模板计数 → 裁剪预算 → 普通文本生成');
         current();
-        run.output = completion.text;
         run.timings = completion.timings;
         run.tokenUsage = completion.usage;
         if (isNoReply(completion.text)) { run.status = 'silent'; run.phase = '喵酱选择沉默'; }
+        else if (repeatsReply(completion.text, this.state.messages)) {
+          run.status = 'silent'; run.phase = '拦截重复回复';
+          skip('重复检查', '与最近四条自己的回复存在大段重复，已丢弃，不发送、不自动重试');
+        }
         else {
+          run.output = completion.text;
           const seq = this.state.nextSeq++;
           const message: Message = { id: `m_${seq}`, seq, speakerId: BOT_ID, speakerName: BOT_NAME, at: new Date().toISOString(), text: completion.text, mentions: [], replyTo: snapshot.focus.id, runId: run.id, sample: run.mode === 'replay' };
           if (this.deliver) {
@@ -266,6 +330,7 @@ export class Harness {
       if (epoch === this.epoch) {
         this.state.cursor = Math.max(this.state.cursor, snapshot.through);
         run.endedAt = new Date().toISOString();
+        try { await this.compactContext(); } catch (error) { this.storageError = `上下文裁剪失败：${(error as Error).message}`; }
         this.busy = false;
         this.controller = undefined;
         this.schedule();
@@ -289,6 +354,7 @@ export function replayProviders(id: string): Providers {
   if (!scenario) throw new Error('没有这个演示回放');
   const delay = () => new Promise<void>(resolve => setTimeout(resolve, 350));
   return {
+    window: async messages => ({ messages, tokens: 0, budget: 1760, exact: false }),
     exaConfigured: () => true,
     modelStatus: async () => ({ ...EMPTY_MODEL }),
     judge: async () => { await delay(); return { probabilities: { ...scenario.probabilities }, raw: { fixture: true, note: '固定演示值，并非 Jev 实测结果' } }; },

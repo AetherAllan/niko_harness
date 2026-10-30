@@ -2,10 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Harness, initialState, isNoReply, takeSnapshot, validateSettings } from '../server/core.ts';
 import { BOT_ID, BOT_NAME, DEFAULT_SETTINGS } from '../shared.ts';
+import type { Settings } from '../shared.ts';
 import type { Providers } from '../server/providers.ts';
 
 function providers(overrides: Partial<Providers> = {}): Providers {
   return {
+    window: async messages => ({ messages, tokens: 0, budget: 1760, exact: true }),
     judge: async () => ({ probabilities: { should_reply: 0.9, needs_web: 0, needs_memory: 0 }, raw: { fixture: true } }),
     modelStatus: async () => ({ available: true, loraVerified: true, contextSize: 4096, model: 'fixture', adapter: 'fixture', detail: '' }),
     query: async () => 'fixture query',
@@ -31,9 +33,18 @@ test('explicit mentions use a 100% reply decision while preserving the independe
   assert.equal(h.state.messages.at(-1)?.speakerName, '喵酱');
 });
 
+test('a literal explicit @ name also uses a 100% reply decision', async () => {
+  const h = create(providers({ judge: async () => ({ probabilities: { should_reply: 0.05, needs_web: 0, needs_memory: 0 }, raw: {} }) }));
+  message(h, '@喵酱 这条我认');
+  const run = (await h.tick())!;
+  assert.equal(run.status, 'replied');
+  assert.deepEqual(run.replyDecision, { probability: 1, source: 'mention' });
+  assert.equal(run.probabilities?.should_reply, 0.05);
+});
+
 test('mentioning somebody else or typing a name does not force a reply', async () => {
   const h = create(providers({ judge: async () => ({ probabilities: { should_reply: 0.1, needs_web: 0, needs_memory: 0 }, raw: {} }) }));
-  message(h, '@喵酱 是她的名字，我在问阿青', ['aqing']);
+  message(h, '喵酱是她的名字，我在问阿青', ['aqing']);
   const run = (await h.tick())!;
   assert.equal(run.status, 'silent');
   assert.deepEqual(run.replyDecision, { probability: 0.1, source: 'jev' });
@@ -194,8 +205,27 @@ test('settings and message trust boundaries reject malformed inputs', () => {
   assert.throws(() => validateSettings({ ...DEFAULT_SETTINGS, heartbeatMin: 13, heartbeatMax: 5 }));
   assert.throws(() => validateSettings({ ...DEFAULT_SETTINGS, thresholds: { ...DEFAULT_SETTINGS.thresholds, should_reply: NaN } }));
   assert.throws(() => validateSettings({ ...DEFAULT_SETTINGS, searchResults: 100 }));
+  assert.throws(() => validateSettings({ ...DEFAULT_SETTINGS, sampling: { ...DEFAULT_SETTINGS.sampling, temperature: NaN } }));
+  assert.throws(() => validateSettings({ ...DEFAULT_SETTINGS, mockSpeakers: [{ id: BOT_ID, name: '冒充机器人' }] }));
   const h = create();
   assert.throws(() => h.addMessage({ speakerId: BOT_ID, text: 'pretend to be the bot' }));
   assert.throws(() => h.addMessage({ speakerId: 'aqing', text: 'x'.repeat(2001) }));
   assert.throws(() => h.addMessage({ speakerId: 'aqing', text: 'hello', replyTo: 'missing' }));
+});
+
+test('mock aliases and generation parameters reload without changing an in-flight snapshot', async () => {
+  const gate = deferred<Awaited<ReturnType<Providers['judge']>>>();
+  const seen: Settings[] = [];
+  const h = create(providers({ judge: () => gate.promise, generate: async (_snapshot, settings) => { seen.push(settings); return { text: '聊点新的吧。', timings: {}, usage: { prompt: 1, completion: 1 } }; } }));
+  h.settings({ ...h.state.settings, mockSpeakers: [{ id: 'friend_1', name: '模拟群友' }], sampling: { ...h.state.settings.sampling, temperature: 0.8 } });
+  h.addMessage({ speakerId: 'friend_1', text: '第一轮' });
+  const task = h.tick();
+  h.settings({ ...h.state.settings, sampling: { ...h.state.settings.sampling, temperature: 0.9, presence_penalty: 0.6 } });
+  gate.resolve({ probabilities: { should_reply: 1, needs_web: 0, needs_memory: 0 }, raw: {} });
+  await task;
+  assert.equal(seen[0].sampling.temperature, 0.8);
+  h.addMessage({ speakerId: 'friend_1', text: '第二轮' }); await h.tick();
+  assert.equal(seen[1].sampling.temperature, 0.9);
+  assert.equal(seen[1].sampling.presence_penalty, 0.6);
+  assert.equal(h.state.messages[0].speakerName, '模拟群友');
 });
