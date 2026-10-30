@@ -1,0 +1,19 @@
+services:
+  napcat:
+    image: mlikiowa/napcat-docker@sha256:696e9574a0f6fb2f86cbecba8a32048f2a5823117dc9b13c6c02637ad890fa8b
+    container_name: niko-napcat
+    restart: unless-stopped
+    environment:
+      ACCOUNT: "2032635652"
+      NAPCAT_UID: "1000"
+      NAPCAT_GID: "1000"
+      TZ: America/Los_Angeles
+    ports:
+      - "127.0.0.1:6099:6099"
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - ./data/napcat/qq:/app/.config/QQ
+      - ./data/napcat/config:/app/napcat/config
+      - ./data/napcat/plugins:/app/napcat/plugins
+    mem_limit: 1536m
+    shm_size: 128m
